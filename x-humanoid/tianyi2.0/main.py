@@ -17,7 +17,18 @@ x-humanoid/tianyi2.0/main.py — 天轶2.0 Pro 设备 bundle 统一入口。
     SLAMTEC_URL — Slamtec底盘API地址（默认 http://192.168.11.1:1448）
 """
 
+# Make every log line one atomic, control-character-free write, so concurrent
+# writers cannot tear a Docker log record. Must run before anything prints.
+try:
+    from common import logsafe
+    logsafe.install()
+except ImportError as _e:  # running outside the container image
+    import sys as _sys
+    _sys.stderr.write(f"[bundle] logsafe unavailable ({_e}); stdout unprotected\n")
+
+
 import json
+import base64
 import os
 import queue as _queue
 import re
@@ -88,6 +99,72 @@ def _ensure_lyre_audio_mode():
         print(f"[lyre] WARNING: could not switch to {target} mode: {e}")
 
 
+_AUTO_SELF_CHECK_SCRIPT = r'''import json
+import os
+import shutil
+import tempfile
+
+path = "/home/ubuntu/ros2ws/install/proc_manager/share/proc_manager/param/proc_manager_ty2.0_pro.json"
+desired_start_proc = ["body_control"]
+desired_action = [{"power_light": "SYSTEM_SERVICE_START"}, {"robot_status": "Initing"}]
+
+with open(path, encoding="utf-8") as stream:
+    data = json.load(stream)
+trigger = next((item for item in data.get("trigger", [])
+               if item.get("type") == "OnNodeState"
+               and item.get("topic") == "power_board_state"), None)
+if trigger is None:
+    raise RuntimeError("OnNodeState trigger for power_board_state was not found")
+if trigger.get("start_proc") == desired_start_proc and trigger.get("action") == desired_action:
+    print("already-configured")
+    raise SystemExit(0)
+
+backup = path + ".bak-auto-self-check"
+if not os.path.exists(backup):
+    shutil.copy2(path, backup)
+trigger["start_proc"] = desired_start_proc
+trigger["action"] = desired_action
+directory = os.path.dirname(path)
+fd, temporary = tempfile.mkstemp(prefix=os.path.basename(path) + ".tmp-", dir=directory)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        json.dump(data, stream, indent=2, ensure_ascii=False)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+finally:
+    if os.path.exists(temporary):
+        os.unlink(temporary)
+print("updated")
+'''
+
+
+def _ensure_remote_auto_self_check(cfg: dict) -> None:
+    """Ensure the x86 proc_manager trigger starts body_control automatically."""
+    settings = cfg.get("auto_self_check", {})
+    if not settings.get("enabled", True):
+        print("[auto-self-check] disabled")
+        return
+    host = settings.get("ssh_host", "192.168.41.1")
+    user = settings.get("ssh_user", "ubuntu")
+    password = settings.get("ssh_password", "")
+    encoded = base64.b64encode(_AUTO_SELF_CHECK_SCRIPT.encode()).decode("ascii")
+    command = f"python3 -c \"import base64; exec(base64.b64decode('{encoded}'))\""
+    try:
+        result = subprocess.run(
+            ["sshpass", "-p", password, "ssh", "-o", "StrictHostKeyChecking=no",
+             "-o", "ConnectTimeout=3", f"{user}@{host}", command],
+            capture_output=True, text=True, timeout=int(settings.get("timeout", 15)))
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()
+            raise RuntimeError(detail or f"ssh exited with status {result.returncode}")
+        status = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else "completed"
+        print(f"[auto-self-check] {host}: {status}")
+    except Exception as exc:
+        print(f"[auto-self-check] WARNING: {host}: {exc}")
+
+
 def _probe_remote_mics(cfg: dict) -> list[dict]:
     """SSH probe remote hosts for audio devices, deploy & start audio_sender, return device list."""
     ext_mic_cfg = cfg.get("plugins", {}).get("ext_mic", {})
@@ -113,8 +190,8 @@ def _probe_remote_mics(cfg: dict) -> list[dict]:
 
         # Step 1: Probe remote audio devices
         try:
-            result = _ssh("arecord -l")
-            devices = _parse_arecord_output(result.stdout + result.stderr)
+            result = _ssh("arecord -l 2>&1")
+            devices = _parse_arecord_output(result.stdout)
         except Exception as e:
             print(f"[ext_mic/probe] {ssh_host}: SSH probe failed: {e}")
             continue
@@ -149,25 +226,59 @@ def _probe_remote_mics(cfg: dict) -> list[dict]:
         except Exception as e:
             print(f"[ext_mic/probe] {ssh_host}: deploy failed: {e}")
 
-        # Step 3: Start audio_sender if not running (use first detected card)
+        # Step 3: Verify audio_sender is healthy (not just alive) via TCP data probe
         primary_card = devices[0]["card"]
+        healthy = False
         try:
-            check = _ssh("pgrep -f audio_sender.py")
-            if check.returncode != 0 or not check.stdout.strip():
-                _ssh(f"nohup python3 {sender_path} --port {port} --card {primary_card} "
-                     f"> /tmp/audio_sender.log 2>&1 &")
-                time.sleep(1)
-                verify = _ssh("pgrep -f audio_sender.py")
-                if verify.returncode == 0 and verify.stdout.strip():
-                    pid = verify.stdout.strip().splitlines()[0]
-                    print(f"[ext_mic/probe] {ssh_host}: started audio_sender (pid={pid}, card={primary_card}, port={port})")
-                else:
-                    print(f"[ext_mic/probe] {ssh_host}: WARNING: audio_sender did not start")
+            probe_cmd = (
+                f"python3 -c \""
+                f"import socket,sys;"
+                f"s=socket.socket();"
+                f"s.settimeout(3);"
+                f"s.connect(('127.0.0.1',{port}));"
+                f"d=s.recv(1024);"
+                f"s.close();"
+                f"sys.exit(0 if len(d)>0 else 1)\""
+            )
+            check = _ssh(probe_cmd, timeout=10)
+            healthy = (check.returncode == 0)
+        except Exception:
+            pass
+
+        if not healthy:
+            # Kill existing (might be zombie) + restart
+            try:
+                _ssh("pkill -9 -f audio_sender.py 2>/dev/null")
+            except Exception:
+                pass
+            time.sleep(3)  # wait for ALSA device release
+            # Deploy audio_sender.py if missing
+            try:
+                check = _ssh(f"test -f {sender_path} && echo EXISTS")
+                if "EXISTS" not in (check.stdout or ""):
+                    local_src = str(Path(__file__).parent / "audio_sender.py")
+                    subprocess.run(
+                        ["sshpass", "-p", ssh_pass, "scp",
+                         "-o", "StrictHostKeyChecking=no",
+                         local_src, f"{ssh_user}@{ssh_host}:{sender_path}"],
+                        check=True, timeout=15)
+                    print(f"[ext_mic/probe] {ssh_host}: deployed audio_sender.py")
+            except Exception as e:
+                print(f"[ext_mic/probe] {ssh_host}: deploy failed: {e}")
+            # Start fresh
+            _ssh(f"nohup python3 {sender_path} --port {port} --card {primary_card} "
+                 f"> /tmp/audio_sender.log 2>&1 &")
+            time.sleep(2)
+            verify = _ssh("pgrep -f audio_sender.py")
+            if verify.returncode == 0 and verify.stdout.strip():
+                pid = verify.stdout.strip().splitlines()[0]
+                print(f"[ext_mic/probe] {ssh_host}: restarted audio_sender (pid={pid}, card={primary_card}, port={port})")
             else:
-                pid = check.stdout.strip().splitlines()[0]
-                print(f"[ext_mic/probe] {ssh_host}: audio_sender already running (pid={pid})")
-        except Exception as e:
-            print(f"[ext_mic/probe] {ssh_host}: start failed: {e}")
+                print(f"[ext_mic/probe] {ssh_host}: WARNING: audio_sender did not start")
+        else:
+            check = _ssh("pgrep -f audio_sender.py")
+            pid = check.stdout.strip().splitlines()[0] if check.stdout.strip() else "?"
+            print(f"[ext_mic/probe] {ssh_host}: audio_sender healthy (pid={pid})")
 
         # Step 4: Build device list entries (name includes format info)
         for dev in devices:
@@ -258,13 +369,22 @@ class TianyiDeviceBundle:
 
         if plugins_cfg.get("state", {}).get("enabled", False):
             from device import StatePlugin
-            self._plugins.append(StatePlugin(plugins_cfg["state"], namespace, ros2))
+            state_cfg = dict(plugins_cfg["state"])
+            if cfg.get("joints_bridge", {}).get("enabled", False):
+                state_cfg["publish_joints"] = False
+            self._plugins.append(StatePlugin(state_cfg, namespace, ros2))
             print("[bundle] StatePlugin loaded")
 
         if plugins_cfg.get("camera", {}).get("enabled", False):
             from device import CameraPlugin
             self._plugins.append(CameraPlugin(plugins_cfg["camera"], namespace, ros2))
             print("[bundle] CameraPlugin loaded")
+
+        if plugins_cfg.get("camera_snapshot", {}).get("enabled", False):
+            from device import CameraSnapshotPlugin
+            self._plugins.append(CameraSnapshotPlugin(
+                plugins_cfg["camera_snapshot"], namespace, ros2))
+            print("[bundle] CameraSnapshotPlugin loaded")
 
         for config_name, class_name in (("imu", "ImuPlugin"),
                                         ("camera_depth", "DepthCameraPlugin"),
@@ -353,6 +473,11 @@ class TianyiDeviceBundle:
             self._plugins.append(NavPlugin(plugins_cfg["nav"], namespace, ros2, slamtec_client))
             print("[bundle] NavPlugin loaded")
 
+        if plugins_cfg.get("home", {}).get("enabled", False):
+            from device import HomePlugin
+            self._plugins.append(HomePlugin(plugins_cfg["home"], namespace, ros2, slamtec_client))
+            print("[bundle] HomePlugin loaded")
+
         if plugins_cfg.get("chat", {}).get("enabled", False):
             from device import ChatPlugin
             self._plugins.append(ChatPlugin(plugins_cfg["chat"], namespace, ros2))
@@ -367,10 +492,16 @@ class TianyiDeviceBundle:
             self._plugins.append(ControlledSpatialPlugin(plugins_cfg["controlled_spatial"], namespace, ros2, slamtec_client))
             print("[bundle] ControlledSpatialPlugin loaded")
 
+        if plugins_cfg.get("controlled_spatial_map", {}).get("enabled", False):
+            from controlled_spatial_map import ControlledSpatialMapPlugin
+            self._plugins.append(ControlledSpatialMapPlugin(
+                plugins_cfg["controlled_spatial_map"], namespace, ros2, slamtec_client))
+            print("[bundle] ControlledSpatialMapPlugin loaded")
+
         if plugins_cfg.get("robot_faults", {}).get("enabled", False):
-            from device import RobotFaultsPlugin
-            self._plugins.append(RobotFaultsPlugin(plugins_cfg["robot_faults"], namespace, ros2, slamtec_client))
-            print("[bundle] RobotFaultsPlugin loaded")
+            from device import HealthCheckPlugin
+            self._plugins.append(HealthCheckPlugin(plugins_cfg["robot_faults"], namespace, ros2, slamtec_client))
+            print("[bundle] HealthCheckPlugin loaded (health_check)")
 
         if plugins_cfg.get("laser_scan", {}).get("enabled", False):
             from device import LaserScanPlugin
@@ -393,15 +524,30 @@ class TianyiDeviceBundle:
             self._plugins.append(LightPlugin(plugins_cfg["light"], namespace, ros2))
             print("[bundle] LightPlugin loaded")
 
+    # 核心插件始终自动启动，其余等 MCP action:start 触发（懒启动）
+    _ALWAYS_START = {
+        'StatePlugin', 'AsrPlugin', 'RemoteStatePlugin', 'TtsPlugin',
+        'ExtMicPlugin', 'CameraSnapshotPlugin', 'ControlledSpatialPlugin',
+    }
+
     def start_all(self) -> None:
+        self._started_plugins: set = set()
+        started = 0
+        lazy = 0
         for i, p in enumerate(self._plugins):
-            try:
-                p.start()
-            except Exception as e:
-                print(f"[bundle] Plugin {i} ({type(p).__name__}) start() FAILED: {e}", flush=True)
-                import traceback
-                traceback.print_exc()
-        print(f"[bundle] All {len(self._plugins)} plugins started", flush=True)
+            name = type(p).__name__
+            if name in self._ALWAYS_START:
+                try:
+                    p.start()
+                    self._started_plugins.add(p)
+                    started += 1
+                except Exception as e:
+                    print(f"[bundle] {name} start() FAILED: {e}", flush=True)
+                    import traceback
+                    traceback.print_exc()
+            else:
+                lazy += 1
+        print(f"[bundle] {started} plugins auto-started, {lazy} lazy (total {started+lazy})", flush=True)
 
     def stop_all(self) -> None:
         for p in self._plugins:
@@ -429,8 +575,21 @@ class TianyiDeviceBundle:
                         return p.dispatch(tool_name, args)
                     default_action = tool_def.get("default_action", "start")
                     action = args.pop("action", default_action)
+                    # 懒启动：首次 start 时真正初始化插件
+                    if action == "start" and p not in self._started_plugins:
+                        try:
+                            p.start()
+                            self._started_plugins.add(p)
+                            print(f"[bundle] {type(p).__name__} lazy-started via MCP")
+                        except Exception as e:
+                            return {"error": f"start failed: {e}"}
                     args['_tool_name'] = tool_name
                     result = p.dispatch(action, args)
+                    # 工具存在但插件不认这个 action：别把 None 冒泡上去，
+                    # 否则 HTTP 层会报成 "Unknown tool"，把排查引向错误方向。
+                    if result is None:
+                        return {"state": "error",
+                                "error": f"Unknown action: {action} (tool={tool_name})"}
                     return result
         return None
 
@@ -438,6 +597,25 @@ class TianyiDeviceBundle:
 # ── MCP HTTP server ───────────────────────────────────────────────────────────
 
 _bundle: TianyiDeviceBundle | None = None
+_joints_bridge_proc: subprocess.Popen | None = None
+
+
+def _start_joints_bridge(cfg: dict) -> None:
+    global _joints_bridge_proc
+    if not cfg.get("joints_bridge", {}).get("enabled", False):
+        return
+    bridge_path = Path(__file__).parent / "joints_bridge.py"
+    bridge_env = os.environ.copy()
+    bridge_env["CONFIG_PATH"] = os.environ.get(
+        "CONFIG_PATH", str(Path(__file__).parent / "config.yaml"))
+    try:
+        _joints_bridge_proc = subprocess.Popen(
+            [sys.executable, str(bridge_path)],
+            env=bridge_env,
+        )
+        print(f"[bundle] joints bridge started (pid={_joints_bridge_proc.pid})", flush=True)
+    except Exception as e:
+        print(f"[bundle] joints bridge FAILED: {e}", flush=True)
 
 
 def make_handler():
@@ -446,7 +624,11 @@ def make_handler():
             msg = fmt % args
             if '"POST /mcp' in msg and '200' in msg:
                 return
-            print(f"[mcp] {self.address_string()} {msg}")
+            # Escape and cap: msg embeds the raw request line, which on host
+            # networking is remote-controlled bytes going straight into the
+            # Docker log framer (log injection / control-byte corruption).
+            safe = msg.encode("unicode_escape").decode("ascii")[:200]
+            print(f"[mcp] {self.address_string()} {safe}")
 
         def _send(self, status: int, body: str):
             encoded = body.encode()
@@ -604,6 +786,9 @@ def main():
 
     print(f"[bundle] namespace={namespace} mcp_port={mcp_port}")
 
+    # Repair the x86 proc_manager trigger before ROS plugins start publishing.
+    _ensure_remote_auto_self_check(cfg)
+
     # Slamtec HTTP client
     slamtec_url = os.environ.get("SLAMTEC_URL", cfg.get("slamtec", {}).get("base_url", "http://192.168.11.1:1448"))
     from nav_client import SlamtecClient
@@ -623,6 +808,7 @@ def main():
 
     _bundle = TianyiDeviceBundle(cfg, namespace, ros2, slamtec_client, remote_mics=remote_mics)
     _bundle.start_all()
+    _start_joints_bridge(cfg)
 
     _start_registration(mcp_port, cfg.get("name", "Tianyi 2.0 Pro"), "driver")
 
@@ -631,6 +817,8 @@ def main():
 
     def _shutdown(signum, frame):
         print(f"[bundle] signal {signum}, shutting down")
+        if _joints_bridge_proc is not None:
+            _joints_bridge_proc.terminate()
         _bundle.stop_all()
         threading.Thread(target=server.shutdown, daemon=True).start()
 
@@ -640,6 +828,8 @@ def main():
     try:
         server.serve_forever()
     finally:
+        if _joints_bridge_proc is not None and _joints_bridge_proc.poll() is None:
+            _joints_bridge_proc.terminate()
         _bundle.stop_all()
         ros2.shutdown()
 
