@@ -90,6 +90,7 @@ declare -a DRIVER_CATS
 declare -a DRIVER_PROVIDERS
 declare -a DRIVER_MODELS
 declare -a DRIVER_BUILDABLE   # "yes" / "no (no Dockerfile)"
+declare -a DRIVER_CARDS       # JSON array, e.g. [{"name":"base_drive","type":"actuator"}]
 
 _parse_yaml_field() {
     local file="$1" field="$2" val
@@ -103,6 +104,34 @@ _parse_yaml_list() {
     # Extract items under a YAML list key (simple single-level list)
     local file="$1" field="$2"
     awk "/^${field}:/{found=1; next} found && /^  - /{print \$2; next} found && !/^  /{exit}" "${file}" 2>/dev/null || true
+}
+
+_parse_yaml_cards_json() {
+    # Extract the optional `cards:` list into a compact JSON array for
+    # resource-center's driver marketplace listing. Entries must be flow-style,
+    # one per line: `- { name: base_drive, type: actuator }` — no PyYAML
+    # dependency, kept in the same bash-parsing style as the helpers above.
+    # Absent/empty field -> "[]".
+    local file="$1" items
+    items=$(awk '
+        /^cards:/ { found=1; next }
+        found && /^[[:space:]]*-/ {
+            line=$0
+            name=""; type=""
+            if (match(line, /name:[[:space:]]*[A-Za-z0-9_]+/)) {
+                name=substr(line, RSTART, RLENGTH); sub(/^name:[[:space:]]*/, "", name)
+            }
+            if (match(line, /type:[[:space:]]*[A-Za-z0-9_]+/)) {
+                type=substr(line, RSTART, RLENGTH); sub(/^type:[[:space:]]*/, "", type)
+            }
+            if (name != "") {
+                printf "%s{\"name\":\"%s\",\"type\":\"%s\"}", (n++ ? "," : ""), name, type
+            }
+            next
+        }
+        found && !/^[[:space:]]*-/ { exit }
+    ' "${file}" 2>/dev/null) || true
+    echo "[${items}]"
 }
 
 for yaml_file in "${SCRIPT_DIR}"/*/*/driver.yaml "${SCRIPT_DIR}"/*/driver.yaml; do
@@ -122,6 +151,7 @@ for yaml_file in "${SCRIPT_DIR}"/*/*/driver.yaml "${SCRIPT_DIR}"/*/driver.yaml; 
     DRIVER_PROVIDERS+=("$(_parse_yaml_field "${yaml_file}" hardware_provider)")
     DRIVER_MODELS+=("$(_parse_yaml_field "${yaml_file}" hardware_model)")
     DRIVER_BUILDABLE+=("${has_dockerfile}")
+    DRIVER_CARDS+=("$(_parse_yaml_cards_json "${yaml_file}")")
 done
 
 if [ ${#DRIVER_DIRS[@]} -eq 0 ]; then
@@ -232,7 +262,15 @@ fi
 
 select_mirror
 
-docker run --privileged --rm "${BINFMT_IMAGE}" --install arm64
+# ARM64 hosts (including Apple Silicon Docker Desktop) build linux/arm64
+# natively. Registering binfmt there is unnecessary and may fail because
+# Docker Desktop does not expose /proc/sys/fs/binfmt_misc/register.
+HOST_ARCH="$(uname -m)"
+if [ "${HOST_ARCH}" != "arm64" ] && [ "${HOST_ARCH}" != "aarch64" ]; then
+    docker run --privileged --rm "${BINFMT_IMAGE}" --install arm64
+else
+    echo "[info] Native ${HOST_ARCH} host — skipping ARM64 binfmt setup."
+fi
 
 # ── 构建 ──────────────────────────────────────────────────────────────────
 declare -a BUILT_INDICES
@@ -265,15 +303,21 @@ for idx in "${SELECTED_INDICES[@]}"; do
         for extra in "${extras[@]}"; do
             src="${dir}${extra}"
             if [ -d "${src}" ]; then
-                cp -r "${src}" "${BUILD_CTX}/${extra}"
+                # Extras may live above the driver directory (for example ../../common).
+                # Always copy them under their basename so the temporary Docker context
+                # cannot escape through a ../ destination.
+                extra_dest="$(basename "${extra%/}")"
+                cp -r "${src}" "${BUILD_CTX}/${extra_dest}"
             else
                 echo "警告：build_context_extras 中的 ${extra} 不存在，跳过"
             fi
         done
     fi
 
+    # Use the builder selected by the active Docker context. Docker Desktop
+    # commonly names it desktop-linux; forcing `default` crosses contexts and
+    # fails before the build starts.
     docker buildx build \
-        --builder default \
         --platform linux/arm64 \
         ${NO_CACHE} \
         --build-arg "PYPI_MIRROR=${PYPI_MIRROR}" \
@@ -293,8 +337,13 @@ echo "全部完成。"
 
 # ── 注册到 Resource Center ──────────────────────────────────────────────────
 if ${PUSH_ENABLED} && [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; then
+    # Ask only if there is a terminal to ask on; otherwise sync (the key being
+    # set is the opt-in). Test by opening /dev/tty, not with `[ -e ]`: the device
+    # node exists in any container, but opening it without a controlling
+    # terminal fails with ENXIO — which under `set -e` aborted the whole script
+    # here, reporting a successful build as failed.
     SYNC_CONFIRM="y"
-    if [ -t 0 ] || [ -e /dev/tty ]; then
+    if { : >/dev/tty; } 2>/dev/null; then
         printf "\nSync to resource-center (%s)? [Y/n]: " "${RESOURCE_CENTER_URL}" >/dev/tty
         read -r SYNC_CONFIRM </dev/tty || SYNC_CONFIRM="y"
     fi
@@ -310,18 +359,26 @@ if ${PUSH_ENABLED} && [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; then
             desc="${DRIVER_DESCS[$idx]}"
             hw_provider="${DRIVER_PROVIDERS[$idx]:-}"
             hw_model="${DRIVER_MODELS[$idx]:-}"
+            cards="${DRIVER_CARDS[$idx]:-[]}"
             FULL_IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/${hw_provider}/${hw_model}:${TAG}"
 
+            # 架构 facet（resource-center 据此过滤目录，见 resource-center/lib/arch.ts）。
+            # driver 是普通 ROS 容器，没有 L4T / CUDA base，所以不绑定加速器；镜像统一
+            # --platform linux/arm64 构建。将来某个 driver 真需要 Jetson，从它的
+            # driver.yaml 读一个 acc_arch 覆盖这里即可。
             payload="{
   \"imageRef\": \"${FULL_IMAGE}\",
   \"registryImage\": \"${img}\",
   \"tag\": \"${TAG}\",
   \"category\": \"${cat}\",
+  \"acc_arch\": \"agnostic\",
+  \"cpu_arch\": \"arm64\",
   \"hardware_provider\": \"${hw_provider}\",
   \"hardware_model\": \"${hw_model}\",
   \"name\": \"${name}\",
   \"description\": \"${desc}\",
-  \"port\": ${port:-null}
+  \"port\": ${port:-null},
+  \"cards\": ${cards}
 }"
 
             http_code=$(curl -s -o /tmp/rc_register_resp.json -w "%{http_code}" \
