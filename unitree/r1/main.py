@@ -14,6 +14,16 @@ MCP 工具命名规则：直接使用 tool name（mic, tts, led, loco, loco_stat
     CONFIG_PATH — config.yaml 路径（默认同目录下）
 """
 
+# Make every log line one atomic, control-character-free write, so concurrent
+# writers cannot tear a Docker log record. Must run before anything prints.
+try:
+    from common import logsafe
+    logsafe.install()
+except ImportError as _e:  # running outside the container image
+    import sys as _sys
+    _sys.stderr.write(f"[bundle] logsafe unavailable ({_e}); stdout unprotected\n")
+
+
 import json
 import os
 import re
@@ -33,6 +43,14 @@ from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 from unitree_sdk2py.h2.loco.h2_loco_client import LocoClient
 from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
 from rpc_proxy import RpcProxy
+try:
+    from common import lifecycle as _lifecycle
+except ImportError:  # a checkout rather than the container image, where
+    # common/ is copied in beside this file. Load-bearing, so it resolves the
+    # repo root rather than degrading to a no-op the way logsafe does.
+    import sys as _sys, pathlib as _pathlib
+    _sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parents[2]))
+    from common import lifecycle as _lifecycle
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -156,6 +174,10 @@ class R1DeviceBundle:
                     action = args.pop("action", tool_name)
                     args['_tool_name'] = tool_name
                     result = p.dispatch(action, args)
+                    # A plugin that only knows its own verbs declines these
+                    # rather than failing at them — see common/lifecycle.py.
+                    if action in _lifecycle.LIFECYCLE_ACTIONS and _lifecycle.is_declined(result):
+                        return _lifecycle.reply(action)
                     return result
         return None
 
@@ -171,7 +193,16 @@ def make_handler():
             msg = fmt % args
             if '"POST /mcp' in msg and '200' in msg:
                 return
-            print(f"[mcp] {self.address_string()} {msg}")
+            # The dashboard probes for an SSE endpoint this server does not serve,
+            # every couple of seconds. A 404 there is expected, not news, and it
+            # drowns out the posture/error lines in the driver log.
+            if '"GET /mcp/sse' in msg and '404' in msg:
+                return
+            # Escape and cap: msg embeds the raw request line, which on host
+            # networking is remote-controlled bytes going straight into the
+            # Docker log framer (log injection / control-byte corruption).
+            safe = msg.encode("unicode_escape").decode("ascii")[:200]
+            print(f"[mcp] {self.address_string()} {safe}")
 
         def _send(self, status: int, body: str):
             encoded = body.encode()
@@ -317,12 +348,14 @@ def main():
     if not dds_ok:
         print("[bundle] WARNING: DDS unavailable — robot communication disabled, MCP server still starting")
 
-    # Suppress C++ layer stdout (ClientStub recv/future logs) while keeping Python print working.
-    _orig_fd = os.dup(1)
-    _devnull = os.open(os.devnull, os.O_WRONLY)
-    os.dup2(_devnull, 1)
-    os.close(_devnull)
-    sys.stdout = os.fdopen(_orig_fd, 'w', buffering=1)
+    # NOTE: this used to redirect fd 1 to /dev/null and move the real log pipe
+    # to a dup'd high fd, to "suppress C++ layer stdout". That was wrong on both
+    # counts. The noisy output was Python `print()` in the vendored SDK, not C++,
+    # and it was silenced only by an accident of fd inheritance: RpcProxy starts
+    # below, spawns, and inherited fd 1 == /dev/null. Meanwhile the shuffle broke
+    # the "fd 1 is the docker log" invariant, left two buffered writers on one
+    # pipe, and cost every other subprocess its stdout. The SDK prints are now
+    # gated at source (UNITREE_RPC_DEBUG), so no redirection is needed.
 
     # RPC Proxy — runs LocoClient + AudioClient in a subprocess to avoid GIL contention.
     # The main process has many threads (ROS2 executor, camera, mic) which starve

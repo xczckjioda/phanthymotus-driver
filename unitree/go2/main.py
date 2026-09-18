@@ -14,6 +14,16 @@ MCP 工具命名规则：直接使用 tool name（mic, speaker, vui, loco, switc
     CONFIG_PATH — config.yaml 路径（默认同目录下）
 """
 
+# Make every log line one atomic, control-character-free write, so concurrent
+# writers cannot tear a Docker log record. Must run before anything prints.
+try:
+    from common import logsafe
+    logsafe.install()
+except ImportError as _e:  # running outside the container image
+    import sys as _sys
+    _sys.stderr.write(f"[bundle] logsafe unavailable ({_e}); stdout unprotected\n")
+
+
 import json
 import os
 import re
@@ -31,6 +41,14 @@ import rclpy.executors
 
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 from rpc_proxy import RpcProxy
+try:
+    from common import lifecycle as _lifecycle
+except ImportError:  # a checkout rather than the container image, where
+    # common/ is copied in beside this file. Load-bearing, so it resolves the
+    # repo root rather than degrading to a no-op the way logsafe does.
+    import sys as _sys, pathlib as _pathlib
+    _sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parents[2]))
+    from common import lifecycle as _lifecycle
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -126,10 +144,18 @@ class Go2DeviceBundle:
             self._plugins.append(ExtMicPlugin(plugins_cfg["ext_mic"], namespace, executor))
             print("[bundle] ExtMicPlugin loaded")
 
+        external_camera = None
         if plugins_cfg.get("ext_camera", {}).get("enabled", False):
             from ext_devices import ExtCameraPlugin
-            self._plugins.append(ExtCameraPlugin(plugins_cfg["ext_camera"], namespace, executor))
+            external_camera = ExtCameraPlugin(plugins_cfg["ext_camera"], namespace, executor)
+            self._plugins.append(external_camera)
             print("[bundle] ExtCameraPlugin loaded")
+
+        if plugins_cfg.get("vision_capture", {}).get("enabled", False):
+            from vision_capture import VisionCapturePlugin
+            self._plugins.append(VisionCapturePlugin(
+                plugins_cfg["vision_capture"], namespace, executor, external_camera))
+            print("[bundle] VisionCapturePlugin loaded")
 
     def start_all(self) -> None:
         for i, p in enumerate(self._plugins):
@@ -176,6 +202,10 @@ class Go2DeviceBundle:
                     action = args.pop("action", tool_name)
                     args['_tool_name'] = tool_name
                     result = p.dispatch(action, args)
+                    # A plugin that only knows its own verbs declines these
+                    # rather than failing at them — see common/lifecycle.py.
+                    if action in _lifecycle.LIFECYCLE_ACTIONS and _lifecycle.is_declined(result):
+                        return _lifecycle.reply(action)
                     return result
         return None
 
@@ -191,7 +221,11 @@ def make_handler():
             msg = fmt % args
             if '"POST /mcp' in msg and '200' in msg:
                 return
-            print(f"[mcp] {self.address_string()} {msg}")
+            # Escape and cap: msg embeds the raw request line, which on host
+            # networking is remote-controlled bytes going straight into the
+            # Docker log framer (log injection / control-byte corruption).
+            safe = msg.encode("unicode_escape").decode("ascii")[:200]
+            print(f"[mcp] {self.address_string()} {safe}")
 
         def _send(self, status: int, body: str):
             encoded = body.encode()
@@ -336,12 +370,12 @@ def main():
     if not dds_ok:
         print("[bundle] WARNING: DDS unavailable — robot communication disabled, MCP server still starting")
 
-    # Suppress C++ layer stdout (ClientStub recv/future logs) while keeping Python print working.
-    _orig_fd = os.dup(1)
-    _devnull = os.open(os.devnull, os.O_WRONLY)
-    os.dup2(_devnull, 1)
-    os.close(_devnull)
-    sys.stdout = os.fdopen(_orig_fd, 'w', buffering=1)
+    # NOTE: a fd-1 -> /dev/null shuffle used to live here to "suppress C++ layer
+    # stdout". The noise was actually Python `print()` in the vendored SDK, and
+    # the shuffle broke the "fd 1 is the docker log" invariant: two buffered
+    # writers on one pipe (non-atomic above PIPE_BUF -> torn log records) and
+    # every spawned subprocess silently lost stdout. SDK prints are now gated at
+    # source (UNITREE_RPC_DEBUG), so no redirection is needed.
 
     # RPC Proxy — runs SportClient + ObstaclesAvoidClient + VuiClient + VideoClient + MotionSwitcherClient
     # in a subprocess to avoid GIL contention.

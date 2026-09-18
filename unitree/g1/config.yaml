@@ -8,6 +8,7 @@ plugins:
     enabled: true
   speaker:
     enabled: true
+    isolated_process: true
   led:
     enabled: true
   loco:
@@ -18,6 +19,12 @@ plugins:
     enabled: true
   camera:
     enabled: true
+  vision_capture:
+    enabled: true
+    # The existing host bind mount preserves captures across container updates.
+    output_dir: /opt/phanthy-motus/data/vision_capture
+    fps: 15
+    max_duration_s: 30
   lidar:
     enabled: true
   slam:
@@ -26,6 +33,7 @@ plugins:
     db_path: /opt/phanthy-motus/data/spatial.db
   controlled_spatial:
     enabled: true
+    isolated_process: true
     native_slam_pcd_dir: /home/unitree
     native_slam_db_path: /opt/phanthy-motus/data/controlled_spatial.db
   controlled_spatial_map:
